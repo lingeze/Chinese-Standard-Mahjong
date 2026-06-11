@@ -1,0 +1,59 @@
+# ── Python ──
+__pycache__/
+*.py[cod]
+*.py.bak
+*.so
+
+# ── 训练数据 & 预处理数据 ──
+data/
+SL/data/
+RL/data/
+
+# ── 训练日志 & checkpoint ──
+log/
+SL/log/
+RL/log/
+checkpoint/
+RL/checkpoint/
+
+# ── 模型参数文件 ──
+*.pkl
+*.pth
+*.pt
+SL/model/
+RL/model/
+
+# ── 对战结果 ──
+battle_results/
+SL/battle_results/
+
+# ── 提交打包 ──
+*.zip
+submission*/
+submission*/
+
+# ── 调试临时文件 ──
+_debug_test/
+*_debug_test/
+
+# ── Office 临时文件 ──
+~$*
+
+# ── 大文件（课件、论文PDF等） ──
+*.pptx
+*.pdf
+*.docx
+
+# ── 临时提取脚本 ──
+_extract_pdf.py
+_pdf_text.txt
+
+# ── IDE（保留 .vscode 可共享的配置，忽略个人偏好） ──
+.idea/
+*.swp
+*.swo
+*~
+
+# ── OS ──
+.DS_Store
+Thumbs.db
