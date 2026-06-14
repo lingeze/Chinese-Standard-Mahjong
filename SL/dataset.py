@@ -167,12 +167,20 @@ class MahjongGBDataset(Dataset):
         self.augment = augment
         self.cache_size = cache_size
 
+        # ── 保留原始每局样本数（前缀和之前） ──
+        self._match_counts = list(self.match_samples)
+
         # ── 构建前缀和数组 ──
         t = 0
         for i in range(self.matches):
             a = self.match_samples[i]
             self.match_samples[i] = t
             t += a
+
+        # ── 文件分组 shuffle 索引（cache_size>0 时使用，避免随机IO） ──
+        self._sample_index = None
+        if cache_size > 0:
+            self._build_shuffled_index()
 
         # ── 加载数据 ──
         if cache_size > 0:
@@ -203,6 +211,22 @@ class MahjongGBDataset(Dataset):
                     suit_perm_arr = np.array(suit_perm)
                     self._aug_pool.append((suit_perm_arr, do_mirror, am, inv))
 
+    def _build_shuffled_index(self):
+        """构建按文件分组的 shuffle 索引，同局样本连续存放，让每个文件只读一次。"""
+        import random as _random
+        match_order = list(range(self.matches))
+        _random.shuffle(match_order)
+        self._sample_index = []
+        for m in match_order:
+            n = self._match_counts[m]
+            for s in range(n):
+                self._sample_index.append((m, s))
+
+    def reshuffle(self):
+        """每 epoch 调用一次，重新随机排列对局顺序。"""
+        if self._sample_index is not None:
+            self._build_shuffled_index()
+
     def _load_match(self, match_id):
         """延迟加载：从 LRU 缓存或磁盘获取 match 数据。"""
         if match_id in self._file_cache:
@@ -227,11 +251,16 @@ class MahjongGBDataset(Dataset):
             return self._load_match(match_id + self.begin)
 
     def __len__(self):
+        if self._sample_index is not None:
+            return len(self._sample_index)
         return self.samples
 
     def __getitem__(self, index):
-        match_id = bisect_right(self.match_samples, index, 0, self.matches) - 1
-        sample_id = index - self.match_samples[match_id]
+        if self._sample_index is not None:
+            match_id, sample_id = self._sample_index[index]
+        else:
+            match_id = bisect_right(self.match_samples, index, 0, self.matches) - 1
+            sample_id = index - self.match_samples[match_id]
 
         # 全量预加载模式 vs 延迟加载模式
         if self._full_cache is not None:

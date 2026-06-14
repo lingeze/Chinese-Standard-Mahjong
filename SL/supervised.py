@@ -219,14 +219,14 @@ if __name__ == '__main__':
     # Load dataset
     splitRatio = 0.9
     batchSize = 1024
-    trainDataset = MahjongGBDataset(0, splitRatio, augment=True)
-    validateDataset = MahjongGBDataset(splitRatio, 1, augment=False)
-    loader = DataLoader(dataset = trainDataset, batch_size = batchSize, shuffle = True)
+    trainDataset = MahjongGBDataset(0, splitRatio, augment=True, cache_size=2048)
+    validateDataset = MahjongGBDataset(splitRatio, 1, augment=False, cache_size=2048)
+    loader = DataLoader(dataset = trainDataset, batch_size = batchSize, shuffle = False)
     vloader = DataLoader(dataset = validateDataset, batch_size = batchSize, shuffle = False)
 
     # Load model
     from model import ResNetModel
-    model = ResNetModel().to('cuda')
+    model = ResNetModel(in_channels=145).to('cuda')
     optimizer = torch.optim.Adam(model.parameters(), lr = 5e-4)
 
     # Save model architecture
@@ -268,6 +268,7 @@ if __name__ == '__main__':
     for e in range(20):
         print('Epoch', e, 'LR:', optimizer.param_groups[0]['lr'])
         epoch_start = time.time()
+        trainDataset.reshuffle()  # 文件级随机，保证 cache 友好
         model.train()
         train_loss_sum = 0.0
         train_batches = 0
@@ -280,7 +281,7 @@ if __name__ == '__main__':
             train_loss_sum += loss.item()
             train_batches += 1
             last_loss = loss.item()
-            if i % 128 == 0:
+            if i % 16 == 0:
                 print('  Iteration %d/%d'%(i, total_batches), 'policy_loss', loss.item())
             optimizer.zero_grad()
             loss.backward()

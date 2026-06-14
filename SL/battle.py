@@ -108,6 +108,47 @@ def import_model_class(class_spec: str):
     return cls
 
 
+def import_feature_class(class_spec: str):
+    """
+    根据 "module.ClassName" 字符串动态导入 FeatureAgent 类。
+    与 import_model_class 类似，但不限制为 nn.Module 子类。
+    """
+    importlib.invalidate_caches()
+
+    parts = class_spec.rsplit('.', 1)
+    if len(parts) != 2:
+        raise ValueError(
+            f"无法解析 FeatureAgent 类 '{class_spec}'。"
+            f"格式应为 'module.ClassName'，如 'feature.FeatureAgent145'。"
+        )
+    module_name, class_name = parts
+
+    if '.' not in module_name:
+        sl_path = os.path.join(_SL_DIR, module_name + '.py')
+        rl_path = os.path.join(_RL_DIR, module_name + '.py')
+        if os.path.exists(sl_path):
+            spec = importlib.util.spec_from_file_location(module_name, sl_path)
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = mod
+            spec.loader.exec_module(mod)
+        elif os.path.exists(rl_path):
+            spec = importlib.util.spec_from_file_location(module_name, rl_path)
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = mod
+            spec.loader.exec_module(mod)
+        else:
+            mod = importlib.import_module(module_name)
+    else:
+        mod = importlib.import_module(module_name)
+
+    cls = getattr(mod, class_name, None)
+    if cls is None:
+        raise ImportError(
+            f"模块 '{module_name}' 中没有找到类 '{class_name}'。"
+        )
+    return cls
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # ModelWrapper — 将 SL 模型适配到 RL env 的接口
 # ═══════════════════════════════════════════════════════════════════════
@@ -125,10 +166,20 @@ class ModelWrapper:
         期望  -> action_index (int)
     """
 
-    def __init__(self, model_class, checkpoint_path, device='cpu'):
+    def __init__(self, model_class, checkpoint_path, device='cpu', feature_agent_class=None):
         self.device = device
-        self.model = model_class()   # 调用无参构造函数
+        self.feature_agent_class = feature_agent_class  # 该模型对应的 FeatureAgent 类
         state = torch.load(checkpoint_path, map_location=device, weights_only=True)
+        # ── 自动检测 in_channels ──
+        in_channels = None
+        for k, v in state.items():
+            if len(v.shape) == 4 and v.shape[0] >= 64:
+                in_channels = v.shape[1]
+                break
+        if in_channels is not None and in_channels != 6:
+            self.model = model_class(in_channels=in_channels)
+        else:
+            self.model = model_class()
         self.model.load_state_dict(state)
         self.model.train(False)
         self.model.to(device)
@@ -434,7 +485,8 @@ def _collect_game_stats(result, seats, stats, model_keys, model_classes, model_p
 
 def run_tournament(model_paths, model_classes, seat_assignments, num_games,
                    device='cpu', rotate_seats=True, verbose=False,
-                   report_interval=50, capture_invalid=False):
+                   report_interval=50, capture_invalid=False,
+                   feature_agent_classes=None):
     """
     参数:
         model_paths: list[str]，每个 checkpoint 的路径
@@ -453,12 +505,15 @@ def run_tournament(model_paths, model_classes, seat_assignments, num_games,
         invalid_log: list[dict]，无效局的详细信息（仅 capture_invalid=True 时有内容）
     """
     num_models = len(model_paths)
+    if feature_agent_classes is None:
+        feature_agent_classes = [RLFeatureAgent] * num_models
     print(f'Loading {num_models} model(s)...')
     models = []
-    for i, (path, cls) in enumerate(zip(model_paths, model_classes)):
-        m = ModelWrapper(cls, path, device=device)
+    for i, (path, cls, fac) in enumerate(zip(model_paths, model_classes, feature_agent_classes)):
+        m = ModelWrapper(cls, path, device=device, feature_agent_class=fac)
         models.append(m)
-        print(f'  Model {i}: {cls.__name__}  ←  {path}  ({m.param_count:,} params)')
+        feat_name = fac.OBS_SIZE if hasattr(fac, 'OBS_SIZE') else '?'
+        print(f'  Model {i}: {cls.__name__}({feat_name}ch)  ←  {path}  ({m.param_count:,} params)')
 
     unique_models = len(set(zip(model_paths, model_classes)))
     print(f'Unique models: {unique_models}')
@@ -494,6 +549,7 @@ def run_tournament(model_paths, model_classes, seat_assignments, num_games,
 
     invalid_log = []  # 收集无效局的详细信息
 
+    print(f'Starting {num_games} deals ({num_games * 4} games)...')
     start_time = time.time()
 
     for deal_id in range(num_games):
@@ -505,7 +561,9 @@ def run_tournament(model_paths, model_classes, seat_assignments, num_games,
             seats_base = list(seat_assignments)
 
         # ── 第一局：随机发牌 ──
-        env = MahjongGBEnv(config={'agent_clz': RLFeatureAgent})
+        agent_clzs = [feature_agent_classes[seats_base[s]] for s in range(4)]
+        env = MahjongGBEnv(config={'agent_clz': RLFeatureAgent,
+                                    'agent_clzs': agent_clzs})
         result = run_one_game(env, models, seats_base, verbose=verbose,
                               capture_invalid=capture_invalid)
         _collect_game_stats(result, seats_base, stats, model_keys,
@@ -516,13 +574,20 @@ def run_tournament(model_paths, model_classes, seat_assignments, num_games,
 
         # ── 同一副牌，每个模型轮换座位再打 3 局 ──
         for rot in range(1, 4):
-            env_r = MahjongGBEnv(config={'agent_clz': RLFeatureAgent})
-            env_r.reset(prevalentWind=prev_wind, tileWall=tile_wall)
             seats_rot = [seats_base[(s - rot) % 4] for s in range(4)]
+            agent_clzs_rot = [feature_agent_classes[seats_rot[s]] for s in range(4)]
+            env_r = MahjongGBEnv(config={'agent_clz': RLFeatureAgent,
+                                          'agent_clzs': agent_clzs_rot})
+            env_r.reset(prevalentWind=prev_wind, tileWall=tile_wall)
             result = run_one_game(env_r, models, seats_rot, verbose=verbose,
                                   capture_invalid=capture_invalid)
             _collect_game_stats(result, seats_rot, stats, model_keys,
                                model_classes, model_paths, invalid_log, deal_id, rot)
+
+        # ── 第一局打完给个反馈 ──
+        if deal_id == 0:
+            print(f'  First deal done ({4} games), ~{time.time() - start_time:.0f}s elapsed, '
+                  f'est. total ~{(time.time() - start_time) * num_games / 60:.0f}min')
 
         # ── 进度打印（以 deal 为单位） ──
         if (deal_id + 1) % report_interval == 0 or deal_id == num_games - 1:
@@ -797,6 +862,12 @@ def parse_args():
                         '数量须与 --models 一致。'
                         '默认全部为 model.CNNModel。'
                         '示例: model.CNNModel model.ResNetModel')
+    p.add_argument('--feature-classes', nargs='+', default=None,
+                   help='每个模型对应的 FeatureAgent 类 (格式: module.ClassName)。'
+                        '数量须与 --models 一致。'
+                        '默认全部为 feature.FeatureAgent。'
+                        '用于 6 维 / 145 维模型混战。'
+                        '示例: feature.FeatureAgent feature.FeatureAgent145')
     p.add_argument('--seats', nargs=4, type=int, default=None,
                    help='4个座位分别使用哪个模型索引 (默认: 2模型时交叉坐, 4模型时各坐1位)')
     p.add_argument('--games', type=int, default=200,
@@ -845,6 +916,21 @@ def main():
         from model import CNNModel as DefaultModel
         model_classes = [DefaultModel] * len(model_paths)
 
+    # ── FeatureAgent 类（动态导入） ──
+    if args.feature_classes:
+        if len(args.feature_classes) != len(model_paths):
+            p.error(
+                f'--feature-classes 数量 ({len(args.feature_classes)}) '
+                f'与 --models 数量 ({len(model_paths)}) 不一致。'
+            )
+        feature_agent_classes = []
+        for spec in args.feature_classes:
+            cls = import_feature_class(spec)
+            feature_agent_classes.append(cls)
+            print(f'Imported feature class: {spec} → {cls.__name__}({cls.OBS_SIZE}ch)')
+    else:
+        feature_agent_classes = [RLFeatureAgent] * len(model_paths)
+
     # ── 座位分配 ──
     if args.seats:
         seat_assignments = list(args.seats)
@@ -876,6 +962,7 @@ def main():
     config = {
         'models': model_paths,
         'model_classes': [cls.__name__ for cls in model_classes],
+        'feature_classes': [f'{cls.__name__}({getattr(cls, "OBS_SIZE", "?")}ch)' for cls in feature_agent_classes],
         'seat_assignments': seat_assignments,
         'num_games': args.games,
         'rotate_seats': not args.no_rotate,
@@ -900,6 +987,7 @@ def main():
         verbose=args.verbose,
         report_interval=args.report_interval,
         capture_invalid=args.invalid_log,
+        feature_agent_classes=feature_agent_classes,
     )
 
     print_report(stats, model_keys, run_dir, invalid_log)

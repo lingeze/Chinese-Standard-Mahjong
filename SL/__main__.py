@@ -1,5 +1,5 @@
 # Agent part
-from feature import FeatureAgent
+from feature import FeatureAgent, FeatureAgent145
 
 # Model part
 from model import CNNModel
@@ -14,12 +14,37 @@ def obs2response(model, obs):
     response = agent.action2response(action)
     return response
 
+def _detect_from_checkpoint(state_dict):
+    """从 checkpoint 自动检测 in_channels 和模型类型。"""
+    in_channels = 6
+    is_resnet = False
+    for k, v in state_dict.items():
+        if len(v.shape) == 4 and v.shape[0] >= 64:
+            in_channels = v.shape[1]
+            break
+    for k in state_dict.keys():
+        if k.startswith('stem.'):
+            is_resnet = True; break
+        if k.startswith('_tower.'):
+            break
+    return in_channels, is_resnet
+
 import sys
 
 if __name__ == '__main__':
-    model = ResNetModel()
-    data_dir = 'data/mahjong.pkl'
-    model.load_state_dict(torch.load(data_dir, map_location = torch.device('cpu')))
+    data_dir = 'data/mahjong2.pkl'
+    state = torch.load(data_dir, map_location=torch.device('cpu'))
+    in_channels, is_resnet = _detect_from_checkpoint(state)
+
+    if is_resnet:
+        model = ResNetModel(in_channels=in_channels)
+    else:
+        model = CNNModel(in_channels=in_channels)
+    model.load_state_dict(state)
+
+    # 根据通道数选择匹配的 FeatureAgent（6维 vs 145维）
+    AgentClass = FeatureAgent145 if in_channels >= 100 else FeatureAgent
+
     angang = None
     zimo = False
     input()
@@ -29,7 +54,7 @@ if __name__ == '__main__':
         t = request.split()
         if t[0] == '0':
             seatWind = int(t[1])
-            agent = FeatureAgent(seatWind)
+            agent = AgentClass(seatWind)
             agent.request2obs('Wind %s' % t[2])
             print('PASS')
         elif t[0] == '1':

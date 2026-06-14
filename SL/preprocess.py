@@ -1,4 +1,4 @@
-from feature import FeatureAgent
+from feature import FeatureAgent145
 import numpy as np
 import json
 
@@ -25,8 +25,8 @@ def saveData():
     assert [len(x) for x in obs] == [len(x) for x in actions], 'obs actions not matching!'
     l.append(sum([len(x) for x in obs]))
     np.savez('data/%d.npz'%matchid
-        , obs = np.stack([x['observation'] for i in range(4) for x in obs[i]]).astype(np.int8)
-        , mask = np.stack([x['action_mask'] for i in range(4) for x in obs[i]]).astype(np.int8)
+        , obs = np.stack([x['observation'] for i in range(4) for x in obs[i]]).astype(np.float32)
+        , mask = np.stack([x['action_mask'] for i in range(4) for x in obs[i]]).astype(np.float32)
         , act = np.array([x for i in range(4) for x in actions[i]])
     )
     for x in obs: x.clear()
@@ -40,7 +40,7 @@ with open('data/data.txt', encoding='UTF-8') as f:
             line = f.readline()
             continue
         if t[0] == 'Match':
-            agents = [FeatureAgent(i) for i in range(4)]
+            agents = [FeatureAgent145(i) for i in range(4)]
             matchid += 1
             if matchid % 128 == 0:
                 print('Processing match %d %s...' % (matchid, t[1]))
