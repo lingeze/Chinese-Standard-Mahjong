@@ -213,11 +213,17 @@ class MyResNet(nn.Module):
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model', type=str, default='resnet', choices=['resnet','resnet_deep','cnn'])
-    parser.add_argument('--epochs', type=int, default=20)
-    parser.add_argument('--lr', type=float, default=5e-4)
-    parser.add_argument('--num-resblocks', type=int, default=18)
-    parser.add_argument('--label-smoothing', type=float, default=0.0)
+    parser.add_argument('--model', type=str, default='resnet',
+                        choices=['resnet', 'resnet_deep', 'cnn'],
+                        help='Model architecture (default: resnet)')
+    parser.add_argument('--epochs', type=int, default=40,
+                        help='Number of epochs (default: 40)')
+    parser.add_argument('--lr', type=float, default=5e-4,
+                        help='Learning rate (default: 5e-4)')
+    parser.add_argument('--num-resblocks', type=int, default=18,
+                        help='残差块数，仅 --model resnet_deep 时生效 (default: 18)')
+    parser.add_argument('--label-smoothing', type=float, default=0.0,
+                        help='标签平滑系数，0 为关闭 (default: 0)')
     args = parser.parse_args()
 
     logdir = 'log/'
@@ -225,6 +231,7 @@ if __name__ == '__main__':
     run_dir = os.path.join(logdir, 'run_' + timestamp)
     os.makedirs(os.path.join(run_dir, 'checkpoint'), exist_ok=True)
 
+    # Load dataset
     splitRatio = 0.9
     batchSize = 1024
     trainDataset = MahjongGBDataset(0, splitRatio, augment=True, cache_size=2048)
@@ -232,6 +239,7 @@ if __name__ == '__main__':
     loader = DataLoader(dataset = trainDataset, batch_size = batchSize, shuffle = False)
     vloader = DataLoader(dataset = validateDataset, batch_size = batchSize, shuffle = False)
 
+    # Load model — 原版 ResNetModel(9块) 不受影响
     if args.model == 'resnet_deep':
         from model import ResNetModelDeep as ModelClass
         model = ModelClass(in_channels=145, num_resblocks=args.num_resblocks).to('cuda')
@@ -252,11 +260,12 @@ if __name__ == '__main__':
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         f.write(f'Total parameters: {total_params:,}\n')
         f.write(f'Trainable parameters: {trainable_params:,}\n')
-    warmup_epochs = max(5, args.epochs // 10)
-    base_lr = args.lr
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs - warmup_epochs, eta_min=1e-6)
 
+    # Cosine annealing — 比 StepLR 更平滑
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epochs, eta_min=1e-6)
+
+    # ── Save all hyperparameters for future reference ──
     save_hyperparams(
         run_dir=run_dir, model=model, optimizer=optimizer,
         scheduler=scheduler, train_dataset=trainDataset,
@@ -280,47 +289,32 @@ if __name__ == '__main__':
 
     total_batches = len(trainDataset) // batchSize + 1
     last_confusion = None
-    use_amp = torch.cuda.is_available()
-    scaler = torch.amp.GradScaler('cuda', enabled=use_amp) if use_amp else None
 
+    # Train and validate
     for e in range(args.epochs):
-        if e < warmup_epochs:
-            warmup_lr = 1e-6 + (base_lr - 1e-6) * (e / warmup_epochs)
-            for pg in optimizer.param_groups:
-                pg['lr'] = warmup_lr
         print('Epoch', e, 'LR:', optimizer.param_groups[0]['lr'])
         epoch_start = time.time()
-        trainDataset.reshuffle()
+        trainDataset.reshuffle()  # 文件级随机，保证 cache 友好
         model.train()
         train_loss_sum = 0.0
         train_batches = 0
         last_loss = 0.0
 
         for i, d in enumerate(loader):
-            with torch.amp.autocast('cuda', enabled=use_amp):
-                input_dict = {'is_training': True, 'obs': {'observation': d[0].cuda(), 'action_mask': d[1].cuda()}}
-                logits = model(input_dict)
-                loss = F.cross_entropy(logits, d[2].long().cuda(), label_smoothing=args.label_smoothing)
+            input_dict = {'is_training': True, 'obs': {'observation': d[0].cuda(), 'action_mask': d[1].cuda()}}
+            logits = model(input_dict)
+            loss = F.cross_entropy(logits, d[2].long().cuda(),
+                                  label_smoothing=args.label_smoothing)
             train_loss_sum += loss.item()
             train_batches += 1
             last_loss = loss.item()
             if i % 16 == 0:
-                print('  Iteration %d/%d'%(i, total_batches), 'loss', loss.item())
+                print('  Iteration %d/%d'%(i, total_batches), 'policy_loss', loss.item())
             optimizer.zero_grad()
-            if use_amp:
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-            else:
-                loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            if use_amp:
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                optimizer.step()
+            loss.backward()
+            optimizer.step()
 
-        if e >= warmup_epochs:
-            scheduler.step()
+        scheduler.step()
         train_loss_avg = train_loss_sum / train_batches
         torch.save(model.state_dict(), run_dir + '/checkpoint/%d.pkl' % e)
 

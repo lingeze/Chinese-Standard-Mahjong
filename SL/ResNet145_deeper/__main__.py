@@ -14,25 +14,29 @@ def obs2response(model, obs):
     return response
 
 def _detect_from_checkpoint(state_dict):
+    """从 checkpoint 自动检测 in_channels、模型类型和深度。"""
     in_channels = 6
     is_resnet = False
     num_resblocks = 9
     for k, v in state_dict.items():
         if len(v.shape) == 4 and v.shape[0] >= 64:
-            in_channels = v.shape[1]; break
+            in_channels = v.shape[1]
+            break
     max_block = 0
     for k in state_dict.keys():
-        if k.startswith('stem.'): is_resnet = True
+        if k.startswith('stem.'):
+            is_resnet = True
         if k.startswith('resblocks.'):
             idx = int(k.split('.')[1])
-            if idx > max_block: max_block = idx
+            if idx > max_block:
+                max_block = idx
     num_resblocks = max_block + 1 if max_block > 0 else 9
     return in_channels, is_resnet, num_resblocks
 
 import sys
 
 if __name__ == '__main__':
-    data_dir = 'data/mahjong2.pkl'
+    data_dir = 'data/mahjong3.pkl'
     state = torch.load(data_dir, map_location=torch.device('cpu'))
     in_channels, is_resnet, num_resblocks = _detect_from_checkpoint(state)
 

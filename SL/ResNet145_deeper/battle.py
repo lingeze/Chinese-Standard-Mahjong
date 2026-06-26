@@ -64,8 +64,10 @@ def import_model_class(class_spec: str):
     """
     根据 "module.ClassName" 字符串动态导入模型类。
 
-    对于不带包前缀的简单模块名（如 "model"），显式从 SL 目录加载，
-    避免 import 时误加载 RL/model.py。
+    支持格式:
+      - "model.CNNModel"           → 分别在 SL/RL 目录查找 model.py
+      - "RL.model.ResNetModelWithValue" → RL 目录下的 model.py
+      - "SL.model.ResNetModel"     → SL 目录下的 model.py
     """
     importlib.invalidate_caches()
 
@@ -77,27 +79,47 @@ def import_model_class(class_spec: str):
         )
     module_name, class_name = parts
 
-    # ── RL.xxx / SL.xxx 前缀处理 ──
+    # ── 处理 RL.xxx / SL.xxx 前缀 ──
     if module_name.startswith('RL.'):
         sub_module = module_name[3:]
         rl_path = os.path.join(_RL_DIR, sub_module.replace('.', os.sep) + '.py')
-        spec = importlib.util.spec_from_file_location(module_name, rl_path)
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules[module_name] = mod; spec.loader.exec_module(mod)
+        if os.path.exists(rl_path):
+            spec = importlib.util.spec_from_file_location(module_name, rl_path)
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = mod
+            spec.loader.exec_module(mod)
+            print(f'    → module "{module_name}" loaded from: {rl_path}')
+        else:
+            raise ImportError(f"RL module not found: {rl_path}")
     elif module_name.startswith('SL.'):
         sub_module = module_name[3:]
         sl_path = os.path.join(_SL_DIR, sub_module.replace('.', os.sep) + '.py')
-        spec = importlib.util.spec_from_file_location(module_name, sl_path)
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules[module_name] = mod; spec.loader.exec_module(mod)
-    elif '.' not in module_name:
-        sl_path = os.path.join(_SL_DIR, module_name + '.py')
         if os.path.exists(sl_path):
             spec = importlib.util.spec_from_file_location(module_name, sl_path)
             mod = importlib.util.module_from_spec(spec)
-            sys.modules[module_name] = mod   # 注册到全局缓存，防止后续再次导入冲突
+            sys.modules[module_name] = mod
             spec.loader.exec_module(mod)
             print(f'    → module "{module_name}" loaded from: {sl_path}')
+        else:
+            raise ImportError(f"SL module not found: {sl_path}")
+
+    # ── 简单模块名（无包前缀）：分别尝试 SL/RL 目录 ──
+    elif '.' not in module_name:
+        sl_path = os.path.join(_SL_DIR, module_name + '.py')
+        rl_path = os.path.join(_RL_DIR, module_name + '.py')
+
+        found_path = None
+        if os.path.exists(sl_path):
+            found_path = sl_path
+        elif os.path.exists(rl_path):
+            found_path = rl_path
+
+        if found_path:
+            spec = importlib.util.spec_from_file_location(module_name, found_path)
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = mod   # 注册到全局缓存，防止后续再次导入冲突
+            spec.loader.exec_module(mod)
+            print(f'    → module "{module_name}" loaded from: {found_path}')
         else:
             mod = importlib.import_module(module_name)
             print(f'    → module "{module_name}" loaded from: {getattr(mod, "__file__", "unknown")}')
@@ -167,11 +189,15 @@ def import_feature_class(class_spec: str):
 
 class ModelWrapper:
     """
-    封装任意 SL 训练出的模型（不限于 CNNModel），使其可直接用于 RL 的 MahjongGBEnv。
+    封装任意训练出的模型（SL 或 RL），使其可直接用于 RL 的 MahjongGBEnv。
 
-    模型接口约定（forward）:
+    SL 模型接口约定 (forward):
         输入  -> {'is_training': bool, 'obs': {'observation': (B,C,4,9), 'action_mask': (B,235)}}
         输出  -> (B, 235)  logits（已 masked）
+
+    RL 模型接口约定 (forward):
+        输入  -> {'observation': (B,C,4,9), 'action_mask': (B,235)}
+        输出  -> ((B, 235) masked_logits, (B, 1) value)  ← tuple
 
     RL env:
         产出  -> {'observation': ndarray(C,4,9), 'action_mask': ndarray(235,)}
@@ -191,10 +217,19 @@ class ModelWrapper:
         if in_channels is not None and in_channels != 6:
             self.model = model_class(in_channels=in_channels)
         else:
-            self.model = model_class()
+            try:
+                self.model = model_class()
+            except TypeError:
+                self.model = model_class(in_channels=6)
         self.model.load_state_dict(state)
         self.model.train(False)
         self.model.to(device)
+
+        # ── 检测模型类型: RL 模型有 value_head 或 _value_branch ──
+        self.is_rl_model = (
+            hasattr(self.model, 'value_head') or
+            hasattr(self.model, '_value_branch')
+        )
 
     @property
     def param_count(self):
@@ -216,15 +251,103 @@ class ModelWrapper:
             np.asarray(obs['action_mask'], dtype=np.float32)
         ).unsqueeze(0).to(self.device)
 
-        input_dict = {
-            'is_training': False,
-            'obs': {'observation': obs_t, 'action_mask': mask_t},
-        }
-
         with torch.no_grad():
-            logits = self.model(input_dict)
+            if self.is_rl_model:
+                # RL model: {'observation': ..., 'action_mask': ...} → (logits, value)
+                input_dict = {
+                    'observation': obs_t,
+                    'action_mask': mask_t,
+                }
+                output = self.model(input_dict)
+                logits = output[0]  # (masked_logits, value)
+            else:
+                # SL model: {'is_training': False, 'obs': ...} → logits
+                input_dict = {
+                    'is_training': False,
+                    'obs': {'observation': obs_t, 'action_mask': mask_t},
+                }
+                logits = self.model(input_dict)
 
         return logits.flatten().argmax().item()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# MCTSWrapper — 在 ModelWrapper 外层加 MCTS 搜索
+# ═══════════════════════════════════════════════════════════════════════
+
+class MCTSWrapper:
+    """
+    包装一个 ModelWrapper，在推理时用 rollout 搜索选择动作。
+
+    注意: 同一个 MCTSWrapper 可能被多个座位共享（如 seats [0,1,0,1]）。
+    因此不存 agent_name，而是从 env 动态推断当前是哪个 agent 在决策。
+    """
+
+    def __init__(self, model_wrapper, num_rollouts=8, top_k=5, threshold=0.6):
+        self._mw = model_wrapper
+        self._num_rollouts = num_rollouts
+        self._top_k = top_k
+        self._threshold = threshold
+        self._env = None
+
+    def set_env(self, env, agent_name=None):
+        """每局开始前调用。agent_name 参数保留但不使用（兼容性）。"""
+        self._env = env
+
+    @property
+    def model(self):
+        return self._mw.model
+
+    @property
+    def model_class_name(self):
+        return self._mw.model_class_name
+
+    @property
+    def param_count(self):
+        return self._mw.param_count
+
+    def __call__(self, obs):
+        """
+        多个合法动作时走 MCTS，否则退回模型 argmax。
+        从当前 env 状态推断 agent_name。
+        """
+        import sys, os as _os2
+        _rl_dir = _os2.path.join(_os2.path.dirname(_os2.path.abspath(__file__)), '..', 'RL')
+        if _rl_dir not in sys.path:
+            sys.path.insert(0, _rl_dir)
+
+        if self._env is None:
+            return self._mw(obs)
+
+        mask = obs.get('action_mask')
+        if mask is None:
+            return self._mw(obs)
+
+        valid_count = int((np.asarray(mask) > 0).sum())
+        if valid_count <= 1:
+            return self._mw(obs)
+
+        # ── 从 env 推断当前决策的 agent_name ──
+        obs_dict = self._env._obs()
+        # 找到自己的 observation: 对比 mask 找到匹配的 agent
+        agent_name = None
+        for name, agent_obs in obs_dict.items():
+            if agent_obs is obs or np.array_equal(agent_obs.get('action_mask', []), mask):
+                agent_name = name
+                break
+        if agent_name is None:
+            return self._mw(obs)
+
+        # ── MCTS 搜索 ──
+        from mcts import mcts_decide
+        return mcts_decide(
+            obs_dict, self._env, self._mw, agent_name,
+            feature_agent_class=None,
+            device=self._mw.device,
+            num_rollouts=self._num_rollouts,
+            top_k=self._top_k,
+            threshold=self._threshold,
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -257,6 +380,14 @@ def run_one_game(env, models, seat_to_model_idx, verbose=False, capture_invalid=
     obs = env.reset()
     done = False
     steps = 0
+
+    # ── 为每个座的 MCTSWrapper 注入 env 引用 ──
+    for seat in range(4):
+        mid = seat_to_model_idx[seat]
+        m = models[mid]
+        if isinstance(m, MCTSWrapper):
+            m.set_env(env, f'player_{seat+1}')
+
     last_action = {}  # agent_name -> (action_index, response_string)
     last_action_mask = {}  # agent_name -> action_mask_array (only when capture_invalid)
 
@@ -498,7 +629,8 @@ def _collect_game_stats(result, seats, stats, model_keys, model_classes, model_p
 def run_tournament(model_paths, model_classes, seat_assignments, num_games,
                    device='cpu', rotate_seats=True, verbose=False,
                    report_interval=50, capture_invalid=False,
-                   feature_agent_classes=None):
+                   feature_agent_classes=None,
+                   mcts_config=None):
     """
     参数:
         model_paths: list[str]，每个 checkpoint 的路径
@@ -509,23 +641,35 @@ def run_tournament(model_paths, model_classes, seat_assignments, num_games,
         rotate_seats: bool，是否在 deals 之间也轮换基准座位
         verbose: bool，是否打印每步
         report_interval: int，每 N 副牌打印进度
+        mcts_config: dict or None — {'num_rollouts': 8, 'top_k': 5, 'threshold': 0.6,
+                                      'model_indices': [0,1,...] or None}
 
     返回:
         (stats, model_keys, invalid_log)
-        stats: dict，按模型 key 汇总的统计
-        model_keys: list[str]
-        invalid_log: list[dict]，无效局的详细信息（仅 capture_invalid=True 时有内容）
     """
     num_models = len(model_paths)
     if feature_agent_classes is None:
         feature_agent_classes = [RLFeatureAgent] * num_models
+
+    # ── MCTS 参数 ──
+    mcts_indices = set()
+    if mcts_config:
+        specified = mcts_config.get('model_indices')
+        mcts_indices = set(specified if specified is not None else range(num_models))
+
     print(f'Loading {num_models} model(s)...')
     models = []
     for i, (path, cls, fac) in enumerate(zip(model_paths, model_classes, feature_agent_classes)):
-        m = ModelWrapper(cls, path, device=device, feature_agent_class=fac)
-        models.append(m)
+        mw = ModelWrapper(cls, path, device=device, feature_agent_class=fac)
+        if i in mcts_indices:
+            mw = MCTSWrapper(mw,
+                           num_rollouts=mcts_config.get('num_rollouts', 8),
+                           top_k=mcts_config.get('top_k', 5),
+                           threshold=mcts_config.get('threshold', 0.6))
+        models.append(mw)
         feat_name = fac.OBS_SIZE if hasattr(fac, 'OBS_SIZE') else '?'
-        print(f'  Model {i}: {cls.__name__}({feat_name}ch)  ←  {path}  ({m.param_count:,} params)')
+        tag = ' [MCTS]' if i in mcts_indices else ''
+        print(f'  Model {i}: {cls.__name__}({feat_name}ch)  ←  {path}  ({mw.param_count:,} params){tag}')
 
     unique_models = len(set(zip(model_paths, model_classes)))
     print(f'Unique models: {unique_models}')
@@ -533,14 +677,14 @@ def run_tournament(model_paths, model_classes, seat_assignments, num_games,
     print(f'Seat assignment template: {seat_assignments}')
     print()
 
-    # ── 模型 key 包含路径上下文，避免同名文件冲突 ──
+    # ── 模型 key 包含路径上下文和 MCTS 标记 ──
     model_keys = []
     for i, (path, cls) in enumerate(zip(model_paths, model_classes)):
-        # 提取路径中的有意义的标识：上级目录 + 文件名
-        # 例: log/run_resnet/checkpoint/19.pkl → ResNetModel@run_resnet/19
         run_dir = os.path.basename(os.path.dirname(os.path.dirname(path)))
         ckpt_name = os.path.splitext(os.path.basename(path))[0]
         key = f'{cls.__name__}@{run_dir}/{ckpt_name}'
+        if i in mcts_indices:
+            key += ' [MCTS]'
         model_keys.append(key)
 
     stats = defaultdict(lambda: {
@@ -646,12 +790,15 @@ def print_report(stats, model_keys, run_dir, invalid_log=None):
          f'{"DealIn%":>8} {"AvgScore":>9} {"AvgFan":>7} {"AvgRank":>8}')
     emit('-' * 87)
 
-    # 用短标签做表头
+    # 用短标签做表头，保留 MCTS 标记
     def label_from_key(k):
         s = stats[k]
         d = os.path.basename(os.path.dirname(os.path.dirname(s['path'])))
         f = os.path.splitext(os.path.basename(s['path']))[0]
-        return f'{s["class_name"]}@{d}/{f}'
+        base = f'{s["class_name"]}@{d}/{f}'
+        if k.endswith(' [MCTS]'):
+            base += '+MCTS'
+        return base
 
     labels = [label_from_key(k) for k in model_keys]
 
@@ -899,6 +1046,14 @@ def parse_args():
     p.add_argument('--invalid-log', action='store_true',
                    help='记录每局无效动作的详细局面（手牌、副露、牌河、尝试的动作），'
                         '保存到 invalid_log.json')
+    p.add_argument('--mcts', nargs='*', type=int, default=None,
+                   metavar=('ROLLOUTS', 'TOPK'),
+                   help='启用 MCTS 搜索。可选参数: ROLLOUTS(默认8) TOPK(默认5)。'
+                        '例如: --mcts 或 --mcts 12 3')
+    p.add_argument('--mcts-threshold', type=float, default=0.3,
+                   help='MCTS 置信度门控 (默认 0.3): top-1 与 top-2 概率差距超过此值跳过搜索')
+    p.add_argument('--mcts-models', nargs='+', type=int, default=None,
+                   help='指定哪些模型索引用 MCTS（默认: 所有模型），如 --mcts-models 1 表示只有第2个模型用 MCTS')
     return p.parse_args()
 
 
@@ -989,6 +1144,24 @@ def main():
         print(f'  {k}: {v}')
     print(f'  output: {run_dir}\n')
 
+    # ── MCTS 配置 ──
+    mcts_config = None
+    if args.mcts is not None:
+        num_rollouts = args.mcts[0] if len(args.mcts) >= 1 else 8
+        top_k = args.mcts[1] if len(args.mcts) >= 2 else 5
+        mcts_config = {
+            'num_rollouts': num_rollouts,
+            'top_k': top_k,
+            'threshold': args.mcts_threshold,
+            'model_indices': args.mcts_models,
+        }
+        print(f'MCTS enabled: rollouts={num_rollouts}, top_k={top_k}, '
+              f'threshold={args.mcts_threshold}')
+        if args.mcts_models:
+            print(f'  MCTS models: {args.mcts_models}')
+        else:
+            print(f'  MCTS models: all')
+
     stats, model_keys, invalid_log = run_tournament(
         model_paths=model_paths,
         model_classes=model_classes,
@@ -1000,6 +1173,7 @@ def main():
         report_interval=args.report_interval,
         capture_invalid=args.invalid_log,
         feature_agent_classes=feature_agent_classes,
+        mcts_config=mcts_config,
     )
 
     print_report(stats, model_keys, run_dir, invalid_log)

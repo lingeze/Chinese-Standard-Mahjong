@@ -25,12 +25,9 @@ class CNNModel(nn.Module):
                 nn.init.kaiming_normal_(m.weight)
 
     def forward(self, input_dict):
-        is_training = input_dict.get("is_training", False)
-        self.train(mode=is_training)
+        self.train(mode = input_dict.get("is_training", False))
         obs = input_dict["obs"]["observation"].float()
         action_logits = self._tower(obs)
-        if is_training:
-            return action_logits
         action_mask = input_dict["obs"]["action_mask"].float()
         inf_mask = torch.clamp(torch.log(action_mask), -1e38, 1e38)
         return action_logits + inf_mask
@@ -119,22 +116,23 @@ class ResNetModel(nn.Module):
                 nn.init.constant_(m.bias, 0)
 
     def forward(self, input_dict):
-        is_training = input_dict.get("is_training", False)
-        self.train(mode=is_training)
+        self.train(mode=input_dict.get("is_training", False))
         obs = input_dict["obs"]["observation"].float()
         action_mask = input_dict["obs"]["action_mask"].float()
 
-        x = self.stem(obs)
-        x = self.resblocks(x)
-        logits = self.head(x)
-
-        if is_training:
-            return logits
+        x = self.stem(obs)         # (B, 64, 4, 9)
+        x = self.resblocks(x)      # (B, 64, 4, 9)
+        logits = self.head(x)      # (B, 235)
 
         inf_mask = torch.clamp(torch.log(action_mask), -1e38, 1e38)
         return logits + inf_mask
 
 
 class ResNetModelDeep(ResNetModel):
+    """
+    加深版 ResNet，18 个残差块（原版 9 个）。
+    下游加载方式完全兼容——只需用 ResNetModelDeep(in_channels=...) 构造即可。
+    """
+
     def __init__(self, in_channels=145, num_resblocks=18):
         super().__init__(in_channels=in_channels, num_resblocks=num_resblocks)
